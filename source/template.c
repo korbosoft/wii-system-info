@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include "pad.h"
+#include "di.h"
 #include "prodinfo.h"
 #include "boot1.h"
 #include "wiimenu.h"
@@ -68,18 +69,9 @@ static struct SystemInfo {
 	} console;
 
 	struct {
-		union {
-			uint32_t value;
-			struct {
-				uint32_t year: 16;
-				uint32_t month: 8;
-				uint32_t day: 8;
-			};
-		} rel_date;
+		DI_DriveVersion version;
 
 		int dvd_support;
-		int rev;
-		int dev_code;
 		int error;
 	} drive;
 
@@ -154,36 +146,31 @@ int getBootInfo() {
 }
 
 /* Go check out https://github.com/Aeplet/DiscDriveDateChecker guys */
-#include <di/di.h>
 int getDriveInfo() {
 	int ret;
-	DI_DriveID drive_id;
+	DI_DriveVersion rev;
 
 	DI_Init();
-	ret = DI_Identify(&drive_id);
+	ret = DI_DriveInquiry(&rev);
 	if (ret == 0) {
-		SystemInfo.drive.rel_date.value = drive_id.rel_date;
-		SystemInfo.drive.rev = drive_id.rev;
-		SystemInfo.drive.dev_code = drive_id.dev_code;
+		SystemInfo.drive.version = rev;
 
 		// The cursed.
-		const uint32_t D3_REL_DATE = 0x20080714;
-		if (drive_id.rel_date < D3_REL_DATE)
+		const uint32_t D3_REV_DATE = 0x20080714;
+		if (rev.date < D3_REV_DATE)
 			SystemInfo.drive.dvd_support = 1;
 
-		else if (drive_id.rel_date == D3_REL_DATE)
+		else if (rev.date == D3_REV_DATE)
 			SystemInfo.drive.dvd_support = 2;
 
 		else
 			SystemInfo.drive.dvd_support = 0;
 
 	} else {
-		if (ret == EIO)
+		if (ret == -1)
 			errorf(CONSOLE_BG_RED "Where is your disc drive?" CONSOLE_RESET);
 
-		SystemInfo.drive.rel_date.value = 0;
 		SystemInfo.drive.error = ret;
-		ret = -1;
 	}
 
 	DI_Close();
@@ -517,20 +504,27 @@ struct STMVersion {
 };
 CHECK_STRUCT_SIZE(struct STMVersion, 0x20);
 
-[[gnu::format(printf, 1, 2)]]
-int writeReportF(const char* fmt, ...);
 bool isvIOS(void) {
 	struct STMVersion* const version = (struct STMVersion *)0x90001000; // random m2 address in fear of Starlet being stupid
+	memset(version, 0, sizeof *version);
 
+#if 1
 	int fd = IOS_Open("/dev/stm/immediate", 0);
 	if (fd < 0) {
 		print_error("IOS_Open(/dev/stm/immediate)", fd);
 		return false;
 	}
 
-	memset(version, 0, sizeof *version);
 	IOS_Ioctl(fd, 0x7001, NULL, 0, version, sizeof(struct STMVersion));
 	IOS_Close(fd);
+#else
+	extern int __STM_SendCommand(int cmd, void* inbuf, uint32_t inlen, void* outbuf, uint32_t outlen);
+
+	int ret = __STM_SendCommand(0x7001, NULL, 0, version, sizeof(struct STMVersion));
+	if (ret < 0) {
+		print_error("STM_ReadVer", ret);
+	}
+#endif
 
 	uint32_t build_date = 0, build_time = 0;
 	sscanf(version->datetimestr, "%06x%06x", &build_date, &build_time);
@@ -608,7 +602,7 @@ inline int writeReport(const char* str) {
 
 [[gnu::format(printf, 1, 2)]]
 int writeReportF(const char* fmt, ...) {
-	static char tmpbuffer[256];
+	char tmpbuffer[256];
 
 	va_list ap;
 	va_start(ap, fmt);
@@ -652,6 +646,9 @@ int main(int argc, const char *argv[]) {
 		}
 	}
 
+	writeReport("Wii System Info v?.?.?\n");
+	writeReportF("running on IOS%i (v%u.%u)\n\n", startupIOS, SystemInfo.iosList[startupIOS].rev_ma, SystemInfo.iosList[startupIOS].rev_mi);
+
 	writeReportF("Console type: %s\n", SystemInfo.console.type);
 	writeReportF("Console model: %s\n", SystemInfo.console.model);
 	writeReportF("Console ID: %08x\n", SystemInfo.console.id);
@@ -664,13 +661,13 @@ int main(int argc, const char *argv[]) {
 		writeReportF("Boot2 version: %u\n\n", SystemInfo.boot2version);
 	}
 
-	if (!SystemInfo.drive.rel_date.value) {
-		writeReportF("DI_Idenitfy failed (%i)\n", SystemInfo.drive.error);
+	if (SystemInfo.drive.error) {
+		writeReportF("DI_DriveInquiry failed (%i)\n", SystemInfo.drive.error);
 	} else {
-		writeReportF("Drive revision date: %04x/%02x/%02x\n", SystemInfo.drive.rel_date.year, SystemInfo.drive.rel_date.month, SystemInfo.drive.rel_date.day);
+		writeReportF("Drive revision date: %04x/%02x/%02x\n", SystemInfo.drive.version.year, SystemInfo.drive.version.month, SystemInfo.drive.version.day);
 		writeReportF("DVD support: %s\n", ((const char* [3]){ "No", "Yes", "Maybe..." })[SystemInfo.drive.dvd_support]);
 		if (SystemInfo.drive.dvd_support == 2)
-			writeReportF("(rev=%#x dev_code=%#x)\n", SystemInfo.drive.rev, SystemInfo.drive.dev_code);
+			writeReportF("(rev=%#x dev_code=%#x)\n", SystemInfo.drive.version.rev, SystemInfo.drive.version.dev_code);
 
 		writeReport("\n");
 	}

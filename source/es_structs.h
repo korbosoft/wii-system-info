@@ -81,6 +81,14 @@ typedef struct {
 } CertECC, NGCert, DeviceCert, APCert;
 CHECK_STRUCT_SIZE(CertECC, 0x180);
 
+typedef union Certificate {
+    CACert ca;
+    CPCert cp, xs, signer;
+    MSCert ms;
+    NGCert ng;
+    APCert ap;
+} Certificate;
+
 typedef enum: uint32_t {
     None        = 0,
     TimeLimit   = 1, // seconds
