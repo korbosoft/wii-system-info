@@ -120,6 +120,10 @@ int getConsoleInfo() {
 	return 0;
 }
 
+/*
+ * ideal: check for bootmii@boot2 here
+ * i already made a whole application about patching /dev/flash access on stock IOS, so this should be simple
+ */
 int getBootInfo() {
 	if (IS_WIIU) // not applicable
 		return -1;
@@ -167,8 +171,7 @@ int getDriveInfo() {
 			SystemInfo.drive.dvd_support = 0;
 
 	} else {
-		if (ret == -1)
-			errorf(CONSOLE_BG_RED "Where is your disc drive?" CONSOLE_RESET);
+		errorf(CONSOLE_BG_RED "Where is your disc drive?" CONSOLE_RESET);
 
 		SystemInfo.drive.error = ret;
 	}
@@ -237,29 +240,46 @@ int processInstalledTitles() {
 	puts("Processing title list...");
 	for (int i = 0; i < count; i++) {
 		uint64_t title = titles[i];
-		uint32_t viewsize = 0;
-		static uint8_t _view_buffer[offsetof(tmd_view, contents[MAX_NUM_TMD_CONTENTS])] [[gnu::aligned(0x20)]];
-		tmd_view *view = (tmd_view *)_view_buffer;
+		uint32_t size = 0;
+		static uint8_t _tmd_buffer[MAX_SIGNED_TMD_SIZE] [[gnu::aligned(0x20)]];
+		TitleMetadata *tmd = (TitleMetadata *)_tmd_buffer;
+		tmd_view *view = (tmd_view *)_tmd_buffer;
 
 		if ((title >> 32) == 0x00000001) { // <system title>
-			ret = ES_GetTMDViewSize(title, &viewsize);
+			ret = ES_GetStoredTMDSize(title, &size);
 			if (ret < 0) {
-				print_error("ES_GetTMDViewSize(%016llx)", ret, title);
+				print_error("ES_GetStoredTMDSize(%016llx)", ret, title);
+				// title folder exists but not title.tmd; what's the point? goodbye
 				if (ret == -106 && title != 0x100000002LL) ES_DeleteTitle(title);
 				continue;
 			}
 
-			ret = ES_GetTMDView(title, view, viewsize);
+			ret = ES_GetStoredTMD(title, (signed_blob *)tmd, size);
 			if (ret < 0) {
-				print_error("ES_GetTMDView(%016llx)", ret, title);
+				print_error("ES_GetStoredTMD(%016llx)", ret, title);
 				continue;
 			}
 
 			if (title == 0x100000002LL) { // System menu
-				SystemInfo.sysmenu.revision = view->title_version;
-				SystemInfo.sysmenu.version = wiimenu_get_version(view->title_version);
-				SystemInfo.sysmenu.region = wiimenu_get_region(view->title_version);
-				SystemInfo.sysmenu.ios = view->sys_version;
+				SystemInfo.sysmenu.revision = tmd->title_version;
+				SystemInfo.sysmenu.version = wiimenu_get_version(tmd->title_version);
+				SystemInfo.sysmenu.region = wiimenu_get_region(tmd->title_version);
+				SystemInfo.sysmenu.ios = tmd->sys_version;
+
+				for (int j = 0; j < tmd->num_contents; j++) {
+					TitleMetadataContent* p = &tmd->contents[j];
+
+					if (p->index == tmd->boot_index) {
+						// similarly, the boot index is, not shared. not for the system menu, anyways
+						char path[sizeof("/title/xxxxxxxx/xxxxxxxx/content/xxxxxxxx.app")];
+						uint32_t cid = (p->cid & ~0xF0000000) | 0x10000000;
+						sprintf(path, "/title/00000001/00000002/content/%08x.app", cid);
+						// technically this will misfire if ISFS is not initialized
+						if (ISFS_ReadDir(path, NULL, &size) == -101) {
+							SystemInfo.sysmenu.priiloader = 1;
+						}
+					}
+				}
 			}
 
 			else if (title - 0x100000003LL < 253) { // IOS
@@ -267,17 +287,17 @@ int processInstalledTitles() {
 				struct ios* ios = &SystemInfo.iosList[slot];
 
 				ios->installed = true;
-				ios->revision  = view->title_version;
+				ios->revision  = tmd->title_version;
 				ios->stubbed   = ((ios->revision & 0x00FF) == 0 || ios->revision == 404);
 
 				if (ios->stubbed || IS_BOOTMII(slot, ios->revision))
 					continue;
 
-				for (int j = 0; j < view->num_contents; j++) {
-					tmd_view_content* p = &view->contents[j];
-					if (view->contents[j].index == 0) {
+				for (int j = 0; j < tmd->num_contents; j++) {
+					TitleMetadataContent* p = &tmd->contents[j];
+					if (p->index == 0) {
 						// index 0 is not shared; that'd be kind of dumb
-						char path[64];
+						char path[] = "/title/xxxxxxxx/xxxxxxxx/content/xxxxxxxx.app";
 						sprintf(path, "/title/00000001/%08x/content/%08x.app", slot, p->cid);
 						int fd = ret = ISFS_Open(path, ISFS_OPEN_READ);
 						if (ret < 0) {
@@ -305,11 +325,11 @@ int processInstalledTitles() {
 					(c)->version = (v)->title_version; \
 				}
 
-				is_compat(title, 0x100, &SystemInfo.compat.BC, view);
-				is_compat(title, 0x101, &SystemInfo.compat.MIOS, view);
+				is_compat(title, 0x100, &SystemInfo.compat.BC, tmd);
+				is_compat(title, 0x101, &SystemInfo.compat.MIOS, tmd);
 
-				is_compat(title, 0x200, &SystemInfo.compat.BCNAND, view);
-				is_compat(title, 0x201, &SystemInfo.compat.BCWFS, view);
+				is_compat(title, 0x200, &SystemInfo.compat.BCNAND, tmd);
+				is_compat(title, 0x201, &SystemInfo.compat.BCWFS, tmd);
 
 #undef is_compat
 			}
@@ -318,13 +338,13 @@ int processInstalledTitles() {
 		else if (title >> 32 == 0x00010001) {
 			for (const struct hbcVersion* hbc = hbcversions; hbc->titleID; hbc++) {
 				if ((title & 0xFFFFFFFF) == hbc->titleID) {
-					ret = ES_GetTMDViewSize(title, &viewsize);
+					ret = ES_GetTMDViewSize(title, &size);
 					if (ret < 0) {
 						print_error("ES_GetTMDViewSize(%016llx)", ret, title);
 						continue;
 					}
 
-					ret = ES_GetTMDView(title, view, viewsize);
+					ret = ES_GetTMDView(title, view, size);
 					if (ret < 0) {
 						print_error("ES_GetTMDView(%016llx)", ret, title);
 						continue;
@@ -396,7 +416,7 @@ static const TitleMetadata fakesigned_tmd [[gnu::aligned(0x40)]] = {
 	.title_id = 0x0001000150494B41,
 	.group_id = 0x1,
 
-	.minor_version = 0x60,
+	.minor_version = 0x70,
 };
 
 static const Ticket sample_ticket [[gnu::aligned(0x40)]] = {
@@ -420,7 +440,7 @@ static const Ticket fakesigned_ticket [[gnu::aligned(0x40)]] = {
 	.ticket_id = 0x0001000070696B61,
 	.title_id = 0x0001000150494B41,
 
-	.padding3 = { 0xA0, 0x00 },
+	.padding3 = { 0x00, 0x69 },
 };
 
 static const tikview ticket_view [[gnu::aligned(0x20)]] = {
@@ -515,16 +535,16 @@ bool isvIOS(void) {
 		return false;
 	}
 
-	IOS_Ioctl(fd, 0x7001, NULL, 0, version, sizeof(struct STMVersion));
+	int ret = IOS_Ioctl(fd, 0x7001, NULL, 0, version, sizeof(struct STMVersion));
 	IOS_Close(fd);
 #else
 	extern int __STM_SendCommand(int cmd, void* inbuf, uint32_t inlen, void* outbuf, uint32_t outlen);
 
 	int ret = __STM_SendCommand(0x7001, NULL, 0, version, sizeof(struct STMVersion));
+#endif
 	if (ret < 0) {
 		print_error("STM_ReadVer", ret);
 	}
-#endif
 
 	uint32_t build_date = 0, build_time = 0;
 	sscanf(version->datetimestr, "%06x%06x", &build_date, &build_time);
@@ -569,8 +589,8 @@ int testIOS(int i) {
 	if (!ios->installed || ios->stubbed || IS_BOOTMII(i, ios->revision))
 		return -1;
 
-	printf("Testing IOS%i...\n", i);
 	IOS_ReloadIOS(i);
+	printf("Testing IOS%i...\n", i);
 
 	ios->vIOS = isvIOS();
 	ios->FSPermissions = testFSPermissions();
@@ -612,6 +632,9 @@ int writeReportF(const char* fmt, ...) {
 	return writeReport_(tmpbuffer, len);
 }
 
+#define _STR(X) #X
+#define STR(X) _STR(X)
+
 int main(int argc, const char *argv[]) {
 	VIDEO_Init();
 	consoleInit(&console);
@@ -646,7 +669,7 @@ int main(int argc, const char *argv[]) {
 		}
 	}
 
-	writeReport("Wii System Info v?.?.?\n");
+	writeReport("Wii System Info " STR(APP_VERSION) "\n");
 	writeReportF("running on IOS%i (v%u.%u)\n\n", startupIOS, SystemInfo.iosList[startupIOS].rev_ma, SystemInfo.iosList[startupIOS].rev_mi);
 
 	writeReportF("Console type: %s\n", SystemInfo.console.type);
@@ -665,7 +688,7 @@ int main(int argc, const char *argv[]) {
 		writeReportF("DI_DriveInquiry failed (%i)\n", SystemInfo.drive.error);
 	} else {
 		writeReportF("Drive revision date: %04x/%02x/%02x\n", SystemInfo.drive.version.year, SystemInfo.drive.version.month, SystemInfo.drive.version.day);
-		writeReportF("DVD support: %s\n", ((const char* [3]){ "No", "Yes", "Maybe..." })[SystemInfo.drive.dvd_support]);
+		writeReportF("DVD support: %s\n", ((const char* const [3]){ "No", "Yes", "Maybe..." })[SystemInfo.drive.dvd_support]);
 		if (SystemInfo.drive.dvd_support == 2)
 			writeReportF("(rev=%#x dev_code=%#x)\n", SystemInfo.drive.version.rev, SystemInfo.drive.version.dev_code);
 
@@ -673,6 +696,11 @@ int main(int argc, const char *argv[]) {
 	}
 
 	writeReportF("System menu %s%c (v%hu) running on IOS%u\n", SystemInfo.sysmenu.version, SystemInfo.sysmenu.region, SystemInfo.sysmenu.revision, SystemInfo.sysmenu.ios);
+	if (SystemInfo.sysmenu.priiloader) {
+		writeReport("Priiloader is installed\n");
+	} else {
+		writeReport("Priiloader is not installed...\n");
+	}
 
 	if (SystemInfo.hbc.version) {
 		writeReportF("Homebrew channel \"%s\" installed, revision %u.%u, running on IOS%u\n\n",
@@ -702,8 +730,6 @@ int main(int argc, const char *argv[]) {
 			writeReport("Stub\n");
 		} else if (IS_BOOTMII(i, ios->revision)) {
 			writeReport("BootMii IOS\n");
-		} else if (!ios->patches) {
-			writeReport("No patches\n");
 		} else {
 #define print_patch(x, s) { if ((x)++) { writeReport(", "); } writeReport(s); }
 			int x = 0;
@@ -720,6 +746,8 @@ int main(int argc, const char *argv[]) {
 			if (ios->FSPermissions == 2) print_patch(x, "Root access");
 
 			if (ios->FlashAccess) print_patch(x, "/dev/flash");
+
+			if (x == 0) writeReport("No patches");
 
 			writeReport("\n");
 #undef print_patch

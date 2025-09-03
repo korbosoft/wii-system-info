@@ -33,7 +33,7 @@ int realcode_init() {
 void realcode_close() {
 	if (fd >= 0) {
 		IOS_Close(fd);
-		fd = -1;
+		fd = IPC_ENOENT;
 	}
 }
 
