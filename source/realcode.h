@@ -10,3 +10,5 @@ void IOS_InvalidateICache(void);
 int IOS_SetUID(uint32_t uid, uint16_t gid);
 
 int realcode_patch(void* start, unsigned len, const void* pattern, unsigned pattern_len, const void* patch, unsigned patch_len);
+
+int patch_flash_access();

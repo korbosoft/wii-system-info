@@ -17,16 +17,16 @@
 #include "common.h"
 #include "pad.h"
 #include "di.h"
+#include "flash.h"
 #include "prodinfo.h"
 #include "boot1.h"
+#include "boot2.h"
 #include "wiimenu.h"
 #include "hbc.h"
 #include "ciosinfo.h"
 #include "sys.h"
 #include "otp.h"
 #include "realcode.h"
-
-struct PrintConsole console;
 
 #define IS_BOOTMII(slot, rev) ((slot == 254) && (rev == 0xFF01 || rev == 31338))
 typedef struct ios {
@@ -77,7 +77,10 @@ static struct SystemInfo {
 
 	// boot1/boot2
 	const struct boot1* boot1;
-	uint32_t boot2version;
+	struct {
+		uint32_t version;
+		int bootmii;
+	} boot2;
 
 	// IOS
 	ios iosList[0x100];
@@ -144,7 +147,107 @@ int getBootInfo() {
 		SystemInfo.boot1 = &fallback;
 	}
 
-	ES_GetBoot2Version(&SystemInfo.boot2version);
+	ES_GetBoot2Version(&SystemInfo.boot2.version);
+
+	if (patch_flash_access() == 0 && Flash_Init() == 0) {
+		// lock in lock in lock in!!
+		// a boot2 blockmap may or may not be stored at the last page of a block, excluding block 0. find the newest blockmap
+		int ret = 0;
+		FlashSizeInfo fs;
+		Boot2Blockmap chosen_map = {};
+
+		Flash_GetSizeInfo(&fs);
+
+		unsigned page_size = FLASH_SHIFT(fs.page_size);
+		unsigned pages_per_block = FLASH_SHIFT(fs.block_size - fs.page_size); // 6
+		unsigned start_block = 1;
+		unsigned max_block = FLASH_SHIFT(20 - fs.block_size); // 20=1MiB
+		unsigned end_block = max_block;
+
+		unsigned char* pagedata = aligned_alloc(0x20, page_size);
+		unsigned char* boot2data = NULL;
+		Boot2Blockmap* maps = (Boot2Blockmap *)pagedata;
+
+		for (unsigned i = start_block; i < max_block; i++) {
+			unsigned page = (i * pages_per_block) + pages_per_block - 1;
+
+			int ret = Flash_ReadPage(page, false, pagedata);
+			if (ret != 0 && ret != FLASH_ECC && ret != FLASH_ECC_CRIT) {
+				errorf("Flash_ReadPage[%i, %u] ret=%i\n", 0, page, ret);
+				memset(&chosen_map, 0, sizeof chosen_map);
+				goto finish_boot2;
+			}
+
+			// Pick a good blockmap; 2 must match each other
+			Boot2Blockmap* map = NULL;
+			if (memcmp(maps[0].signature, Boot2BlockmapSignature, sizeof Boot2BlockmapSignature) == 0 &&
+				(memcmp(&maps[0], &maps[1], sizeof *maps) == 0 || memcmp(&maps[0], &maps[2], sizeof *maps) == 0)) {
+				map = &maps[0];
+			}
+
+			else if (memcmp(maps[1].signature, Boot2BlockmapSignature, sizeof Boot2BlockmapSignature) == 0 &&
+				memcmp(&maps[1], &maps[2], sizeof *maps) == 0) {
+				map = &maps[1];
+			}
+
+			if (!map)
+				continue;
+
+			if (map->generation > chosen_map.generation) {
+				chosen_map = *map;
+				end_block = i;
+			}
+		}
+
+		if (memcmp(chosen_map.signature, Boot2BlockmapSignature, sizeof Boot2BlockmapSignature) != 0)
+			goto finish_boot2;
+
+		unsigned int first_block = 0;
+		for (int i = 1; i < end_block; i++) {
+			if (chosen_map.blocks[i] == 0x00) {
+				first_block = i;
+				break;
+			}
+		}
+
+		// read the boot2 header
+		Boot2Header boot2 = {};
+		ret = Flash_ReadPage(first_block * pages_per_block, false, pagedata);
+		if (ret != 0 && ret != FLASH_ECC) { // ............
+			errorf("Flash_ReadPage[%i, %u] ret=%i\n", 1, first_block * pages_per_block, ret);
+			goto finish_boot2;
+		}
+
+		memcpy(&boot2, pagedata, sizeof(Boot2Header));
+
+		unsigned int size_aligned = __builtin_align_up(boot2.data_offset, page_size);
+		unsigned n_pages = size_aligned / page_size;
+		boot2data = aligned_alloc(0x20, size_aligned);
+
+		// hard assumption: size_aligned <= block_size (n_pages <= pages_per_block)
+		memcpy(boot2data, pagedata, page_size);
+		for (int i = 1; i < n_pages; i++) {
+			unsigned page = (first_block * pages_per_block) + i;
+			ret = Flash_ReadPage(page, false, boot2data + (i * page_size));
+			if (ret != 0 && ret != FLASH_ECC) {
+				errorf("Flash_ReadPage[%i, %u] ret=%i\n", 2, page, ret);
+				goto finish_boot2;
+			}
+		}
+
+		TitleMetadata* tmd = (TitleMetadata *)(boot2data + boot2.header_size + boot2.certs_size + boot2.ticket_size);
+		const char* bootmiistr = (char *)(tmd) + 0x1B2;
+		if (memcmp(bootmiistr, "BM", 2) == 0) {
+			// printf("Yep that's bootmii@boot2 [%s]\n", bootmiistr);
+			SystemInfo.boot2.bootmii = 1;
+		}
+
+finish_boot2:
+		free(boot2data);
+		free(pagedata);
+		Flash_Close();
+		return ret;
+	}
 
 	return 0;
 }
@@ -612,7 +715,7 @@ int writeReport_(const char* buf, int len) {
 
 	strncpy(reportBuffer + reportBufferLen, buf, maxlen);
 	reportBufferLen += len;
-	fwrite(buf, 1, len, stdout);
+	// fwrite(buf, 1, len, stdout);
 	return len;
 }
 
@@ -636,9 +739,6 @@ int writeReportF(const char* fmt, ...) {
 #define STR(X) _STR(X)
 
 int main(int argc, const char *argv[]) {
-	VIDEO_Init();
-	consoleInit(&console);
-	consoleSetWindow(&console, 2, 2, console.con_cols - 2, console.con_rows - 2);
 	puts("Hello World!");
 
 	realcode_init();
@@ -681,7 +781,11 @@ int main(int argc, const char *argv[]) {
 
 	if (!SystemInfo.console.latte) {
 		writeReportF("Boot1 version: %s [%s]\n", SystemInfo.boot1->name, SystemInfo.boot1->trucha ? "unpatched" : "patched");
-		writeReportF("Boot2 version: %u\n\n", SystemInfo.boot2version);
+		writeReportF("Boot2 version: %u\n", SystemInfo.boot2.version);
+		if (SystemInfo.boot2.bootmii) {
+			writeReport(SystemInfo.boot1->trucha ? "Bootmii@boot2 installed\n" : "Bootmii@boot2 installed..?\n");
+		}
+		writeReport("\n");
 	}
 
 	if (SystemInfo.drive.error) {
