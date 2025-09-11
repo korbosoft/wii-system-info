@@ -44,16 +44,12 @@ typedef struct ios {
 	struct cios_info cios;
 
 	// Patches
-	union {
-		unsigned patches;
-		struct {
-			unsigned SignaturePatches: 2; // 1: sigpatches, 2: trucha
-			unsigned ESIdentify: 1;
-			unsigned FSPermissions: 2; // 1: permissions patch, 2: root access
-			unsigned FlashAccess: 1;
-			unsigned USB2: 2; // 1: EHCI, 2: ehcmodule
-		};
-	};
+	unsigned SignaturePatches: 2; // 1: sigpatches, 2: trucha
+	unsigned ESIdentify: 1;
+	unsigned VerifyCK2: 1; // Korean common-key check
+	unsigned FSPermissions: 2; // 1: permissions patch, 2: root access
+	unsigned FlashAccess: 1;
+	unsigned USB2: 2; // 1: EHCI, 2: ehcmodule
 } ios;
 
 static struct SystemInfo {
@@ -76,7 +72,7 @@ static struct SystemInfo {
 	} drive;
 
 	// boot1/boot2
-	const struct boot1* boot1;
+	struct boot1 boot1;
 	struct {
 		uint32_t version;
 		int bootmii;
@@ -131,26 +127,24 @@ int getBootInfo() {
 	if (IS_WIIU) // not applicable
 		return -1;
 
-	static struct boot1 fallback = { "boot1<?>", {}, false };
-
-	otp_read(0, 5, fallback.hash);
-
+	otp_read(0, 5, SystemInfo.boot1.hash);
 	for (const struct boot1* boot1 = boot1versions; boot1->name != NULL; boot1++) {
-		if (memcmp(fallback.hash, boot1->hash, sizeof boot1->hash) == 0) {
-			SystemInfo.boot1 = boot1;
+		if (memcmp(SystemInfo.boot1.hash, boot1->hash, sizeof boot1->hash) == 0) {
+			SystemInfo.boot1.name = boot1->name;
+			SystemInfo.boot1.trucha = boot1->trucha;
 		}
 	}
 
-	if (!SystemInfo.boot1) {
+	if (!SystemInfo.boot1.name) {
 		errorf("Unrecognized boot1 version");
-		errorf("{ %08X %08X %08X %08X %08X }\n", fallback.hash[0], fallback.hash[1], fallback.hash[2], fallback.hash[3], fallback.hash[4]);
-		SystemInfo.boot1 = &fallback;
+		errorf("{ %08X %08X %08X %08X %08X }\n",
+			   SystemInfo.boot1.hash[0], SystemInfo.boot1.hash[1], SystemInfo.boot1.hash[2], SystemInfo.boot1.hash[3], SystemInfo.boot1.hash[4]);
+		SystemInfo.boot1.name = "boot1<?>";
 	}
 
 	ES_GetBoot2Version(&SystemInfo.boot2.version);
 
 	if (patch_flash_access() == 0 && Flash_Init() == 0) {
-		// lock in lock in lock in!!
 		// a boot2 blockmap may or may not be stored at the last page of a block, excluding block 0. find the newest blockmap
 		int ret = 0;
 		FlashSizeInfo fs;
@@ -166,6 +160,7 @@ int getBootInfo() {
 
 		unsigned char* pagedata = aligned_alloc(0x20, page_size);
 		unsigned char* boot2data = NULL;
+		unsigned int* literal_blockmap = calloc(max_block, sizeof (unsigned int));
 		Boot2Blockmap* maps = (Boot2Blockmap *)pagedata;
 
 		for (unsigned i = start_block; i < max_block; i++) {
@@ -202,32 +197,28 @@ int getBootInfo() {
 		if (memcmp(chosen_map.signature, Boot2BlockmapSignature, sizeof Boot2BlockmapSignature) != 0)
 			goto finish_boot2;
 
-		unsigned int first_block = 0;
-		for (int i = 1; i < end_block; i++) {
+		for (int i = 1, k = 0; i < end_block; i++) {
 			if (chosen_map.blocks[i] == 0x00) {
-				first_block = i;
-				break;
+				literal_blockmap[k++] = i;
 			}
 		}
 
 		// read the boot2 header
-		Boot2Header boot2 = {};
-		ret = Flash_ReadPage(first_block * pages_per_block, false, pagedata);
+		ret = Flash_ReadPage(literal_blockmap[0] * pages_per_block, false, pagedata);
 		if (ret != 0 && ret != FLASH_ECC) { // ............
-			errorf("Flash_ReadPage[%i, %u] ret=%i\n", 1, first_block * pages_per_block, ret);
+			errorf("Flash_ReadPage[%i, %u] ret=%i\n", 1, literal_blockmap[0] * pages_per_block, ret);
 			goto finish_boot2;
 		}
 
-		memcpy(&boot2, pagedata, sizeof(Boot2Header));
+		Boot2Header* boot2 = (Boot2Header *)pagedata;
 
-		unsigned int size_aligned = __builtin_align_up(boot2.data_offset, page_size);
+		unsigned int size_aligned = __builtin_align_up(boot2->data_offset, page_size);
 		unsigned n_pages = size_aligned / page_size;
 		boot2data = aligned_alloc(0x20, size_aligned);
 
-		// hard assumption: size_aligned <= block_size (n_pages <= pages_per_block)
 		memcpy(boot2data, pagedata, page_size);
 		for (int i = 1; i < n_pages; i++) {
-			unsigned page = (first_block * pages_per_block) + i;
+			unsigned page = (literal_blockmap[i / pages_per_block] * pages_per_block) + (i % pages_per_block);
 			ret = Flash_ReadPage(page, false, boot2data + (i * page_size));
 			if (ret != 0 && ret != FLASH_ECC) {
 				errorf("Flash_ReadPage[%i, %u] ret=%i\n", 2, page, ret);
@@ -235,7 +226,7 @@ int getBootInfo() {
 			}
 		}
 
-		TitleMetadata* tmd = (TitleMetadata *)(boot2data + boot2.header_size + boot2.certs_size + boot2.ticket_size);
+		TitleMetadata* tmd = (TitleMetadata *)(boot2data + boot2->header_size + boot2->certs_size + boot2->ticket_size);
 		const char* bootmiistr = (char *)(tmd) + 0x1B2;
 		if (memcmp(bootmiistr, "BM", 2) == 0) {
 			// printf("Yep that's bootmii@boot2 [%s]\n", bootmiistr);
@@ -245,6 +236,7 @@ int getBootInfo() {
 finish_boot2:
 		free(boot2data);
 		free(pagedata);
+		free(literal_blockmap);
 		Flash_Close();
 		return ret;
 	}
@@ -612,6 +604,12 @@ int testSignaturePatches(void) {
 	return 0;
 }
 
+int testVerifyCK2(void) {
+	int ret = ES_CheckHasKoreanKey();
+	printf("ES_CheckHasKoreanKey ret=%i\n", ret);
+	return (ret == -1017);
+}
+
 int testFlashAccess(void) {
 	int fd = IOS_Open("/dev/flash", 0);
 	if (fd >= 0) IOS_Close(fd);
@@ -699,6 +697,7 @@ int testIOS(int i) {
 	ios->FSPermissions = testFSPermissions();
 	ios->ESIdentify = testESIdenitfy();
 	ios->SignaturePatches = testSignaturePatches();
+	if (i == 70 || i == 80) ios->VerifyCK2 = testVerifyCK2();
 	ios->FlashAccess = testFlashAccess();
 	ios->USB2 = testUSB2();
 
@@ -780,12 +779,12 @@ int main(int argc, const char *argv[]) {
 	writeReportF("Console area: %s\n\n", SystemInfo.console.area);
 
 	if (!SystemInfo.console.latte) {
-		writeReportF("Boot1 version: %s [%s]\n", SystemInfo.boot1->name, SystemInfo.boot1->trucha ? "unpatched" : "patched");
-		writeReportF("Boot2 version: %u\n", SystemInfo.boot2.version);
-		if (SystemInfo.boot2.bootmii) {
-			writeReport(SystemInfo.boot1->trucha ? "Bootmii@boot2 installed\n" : "Bootmii@boot2 installed..?\n");
+		writeReportF("Boot1 version: %s [%s]\n", SystemInfo.boot1.name, SystemInfo.boot1.trucha ? "unpatched" : "patched");
+		if (!SystemInfo.boot1.trucha) {
+			writeReportF("Boot2 version: %u\n\n", SystemInfo.boot2.version);
+		} else {
+			writeReportF("Boot2 version: %u [Bootmii@boot2 %s]\n\n", SystemInfo.boot2.version, SystemInfo.boot2.bootmii ? "installed" : "not installed...");
 		}
-		writeReport("\n");
 	}
 
 	if (SystemInfo.drive.error) {
@@ -841,6 +840,8 @@ int main(int argc, const char *argv[]) {
 			if (ios->USB2 == 1) print_patch(x, "USB 2.0");
 			if (ios->USB2 >= 2) print_patch(x, "USB 2.0 (ehcmodule)");
 
+			if (ios->VerifyCK2) print_patch(x, "Error 003 patch");
+
 			if (ios->SignaturePatches == 1) print_patch(x, "Signature patch");
 			if (ios->SignaturePatches >= 2) print_patch(x, "Trucha bug");
 
@@ -877,6 +878,7 @@ int main(int argc, const char *argv[]) {
 	}
 #undef print_compat
 
+	fwrite(reportBuffer, 1, reportBufferLen, stdout);
 	printf("report buffer length=%i\n", reportBufferLen);
 	fatInitDefault();
 	FILE* fp = fopen("system_check.log", "w");
