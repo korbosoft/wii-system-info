@@ -76,6 +76,7 @@ static struct SystemInfo {
 	struct {
 		uint32_t version;
 		int bootmii;
+		char bootmii_version[4];
 	} boot2;
 
 	// IOS
@@ -231,6 +232,7 @@ int getBootInfo() {
 		if (memcmp(bootmiistr, "BM", 2) == 0) {
 			// printf("Yep that's bootmii@boot2 [%s]\n", bootmiistr);
 			SystemInfo.boot2.bootmii = 1;
+			strncpy(SystemInfo.boot2.bootmii_version, bootmiistr + 2, 3);
 		}
 
 finish_boot2:
@@ -783,7 +785,11 @@ int main(int argc, const char *argv[]) {
 		if (!SystemInfo.boot1.trucha) {
 			writeReportF("Boot2 version: %u\n\n", SystemInfo.boot2.version);
 		} else {
-			writeReportF("Boot2 version: %u [Bootmii@boot2 %s]\n\n", SystemInfo.boot2.version, SystemInfo.boot2.bootmii ? "installed" : "not installed...");
+			if (SystemInfo.boot2.bootmii) {
+				writeReportF("Boot2 version: %u [Bootmii@boot2 v%s]\n\n", SystemInfo.boot2.version, SystemInfo.boot2.bootmii_version);
+			} else {
+				writeReportF("Boot2 version: %u\n\n", SystemInfo.boot2.version);
+			}
 		}
 	}
 
